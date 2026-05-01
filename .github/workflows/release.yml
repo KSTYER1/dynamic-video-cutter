@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Windows x64 Release
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset windows-x64
+
+      - name: Build
+        run: cmake --build --preset windows-x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $BuildSpec = Get-Content -Raw buildspec.json | ConvertFrom-Json
+          $Name = $BuildSpec.name
+          $Version = $BuildSpec.version
+          $PackageName = "$Name-$Version"
+          $PackageRoot = Join-Path $PWD "package\$PackageName"
+
+          New-Item -ItemType Directory -Force -Path "$PackageRoot\obs-plugins\64bit" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$PackageRoot\data\obs-plugins\$Name\locale" | Out-Null
+
+          Copy-Item "build_x64\RelWithDebInfo\$Name.dll" "$PackageRoot\obs-plugins\64bit\"
+          Copy-Item "build_x64\RelWithDebInfo\$Name.pdb" "$PackageRoot\obs-plugins\64bit\"
+          Copy-Item "data\locale\*.ini" "$PackageRoot\data\obs-plugins\$Name\locale\"
+
+          @"
+          Dynamic Video Cutter - OBS Filter Plugin v$Version
+          ===============================================
+
+          Manual installation: copy BOTH top-level folders, obs-plugins\ and data\,
+          into your OBS Studio installation directory, then restart OBS.
+
+          Add the filter to an OBS media source or VLC video source:
+            Right-click source -> Filters -> "+" -> Dynamic Video Cutter
+          "@ | Set-Content -Encoding UTF8 "$PackageRoot\README.txt"
+
+          Compress-Archive -Path $PackageRoot -DestinationPath "$PWD\$PackageName-windows-x64.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          name: Dynamic Video Cutter ${{ github.ref_name }}
+          body: |
+            Dynamic Video Cutter ${{ github.ref_name }}
+
+            Bugfix release for Windows x64.
+
+            - Handles manual seeking while the cutter is running.
+            - Ignores or clamps playback regions that do not fit the current video.
+            - Fixes saved blend and region UI visibility.
+            - Prevents the cutter from selecting itself as blend filter.
+            - Preserves the previous enabled state of blend filters.
+          files: |
+            dynamic-video-cutter-*-windows-x64.zip
