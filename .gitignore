@@ -1,0 +1,38 @@
+# Build directories
+build/
+build_*/
+out/
+
+# OBS dependencies (downloaded by buildspec)
+.deps/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+
+# Compiled
+*.obj
+*.lib
+*.dll
+*.pdb
+*.exp
+*.so
+*.dylib
+*.a
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
