@@ -9,6 +9,9 @@
 #include "plugin-support.h"
 
 #define MAX_REGIONS 5
+#define MANUAL_SEEK_THRESHOLD_MS 1500
+#define MANUAL_SEEK_COOLDOWN_SEC 2.0f
+#define OWN_SEEK_GRACE_SEC 0.35f
 
 typedef struct {
 	int64_t start;
@@ -30,6 +33,7 @@ typedef struct {
 
 	bool blend_enabled;
 	char *blend_filter_name;
+	char *active_blend_filter_name;
 	int blend_duration_ms;
 
 	struct {
@@ -38,14 +42,23 @@ typedef struct {
 		int64_t end_ms;
 	} regions[MAX_REGIONS];
 
+	int64_t last_media_time_ms;
+	int64_t last_duration_ms;
+	bool have_last_media_time;
+	float manual_seek_cooldown;
+	float own_seek_grace;
+
 	float elapsed;
 	float blend_timer;
 	bool blend_active;
+	bool blend_filter_was_enabled;
 } video_cutter_t;
 
 /* ----------------------------------------------------------------
  * Helpers
  * ---------------------------------------------------------------- */
+
+static void deactivate_blend(video_cutter_t *vc, obs_source_t *parent);
 
 static int64_t get_media_duration(obs_source_t *parent)
 {
@@ -79,17 +92,31 @@ static int64_t get_media_duration(obs_source_t *parent)
 	return duration;
 }
 
-/* Build sorted list of active regions. Returns count. */
-static int build_active_regions(video_cutter_t *vc, active_region_t *out)
+/* Build sorted list of regions that fit the current media duration. */
+static int build_active_regions(video_cutter_t *vc, active_region_t *out,
+				int64_t duration)
 {
 	int count = 0;
 	for (int i = 0; i < MAX_REGIONS; i++) {
-		if (vc->regions[i].enabled &&
-		    vc->regions[i].end_ms > vc->regions[i].start_ms) {
-			out[count].start = vc->regions[i].start_ms;
-			out[count].end = vc->regions[i].end_ms;
-			count++;
-		}
+		if (!vc->regions[i].enabled)
+			continue;
+
+		int64_t start = vc->regions[i].start_ms;
+		int64_t end = vc->regions[i].end_ms;
+
+		if (start < 0)
+			start = 0;
+		if (duration > 0 && end > duration)
+			end = duration;
+
+		if (duration > 0 && start >= duration)
+			continue;
+		if (end <= start)
+			continue;
+
+		out[count].start = start;
+		out[count].end = end;
+		count++;
 	}
 	for (int i = 0; i < count - 1; i++) {
 		for (int j = i + 1; j < count; j++) {
@@ -103,18 +130,36 @@ static int build_active_regions(video_cutter_t *vc, active_region_t *out)
 	return count;
 }
 
-static bool is_inside_any_region(video_cutter_t *vc, int64_t pos)
+static bool is_inside_any_region(video_cutter_t *vc, int64_t pos,
+				 int64_t duration)
 {
-	for (int i = 0; i < MAX_REGIONS; i++) {
-		if (!vc->regions[i].enabled)
-			continue;
-		if (vc->regions[i].end_ms <= vc->regions[i].start_ms)
-			continue;
-		if (pos >= vc->regions[i].start_ms &&
-		    pos < vc->regions[i].end_ms)
+	active_region_t active[MAX_REGIONS];
+	int count = build_active_regions(vc, active, duration);
+
+	for (int i = 0; i < count; i++) {
+		if (pos >= active[i].start && pos < active[i].end)
 			return true;
 	}
 	return false;
+}
+
+static void remember_media_position(video_cutter_t *vc, int64_t current)
+{
+	vc->last_media_time_ms = current;
+	vc->have_last_media_time = true;
+}
+
+static bool detected_external_seek(video_cutter_t *vc, int64_t current,
+				   float seconds)
+{
+	if (!vc->have_last_media_time)
+		return false;
+
+	int64_t expected =
+		vc->last_media_time_ms + (int64_t)(seconds * 1000.0f);
+	int64_t delta = current > expected ? current - expected :
+					     expected - current;
+	return delta > MANUAL_SEEK_THRESHOLD_MS;
 }
 
 static int64_t compute_next_position(video_cutter_t *vc, int64_t current,
@@ -132,7 +177,7 @@ static int64_t compute_next_position(video_cutter_t *vc, int64_t current,
 		jump_ms = 1000;
 
 	active_region_t active[MAX_REGIONS];
-	int count = build_active_regions(vc, active);
+	int count = build_active_regions(vc, active, duration);
 
 	if (count == 0) {
 		/* No regions defined: simple modulo overflow */
@@ -177,9 +222,20 @@ static void activate_blend(video_cutter_t *vc, obs_source_t *parent)
 	    vc->blend_filter_name[0] == '\0')
 		return;
 
+	if (vc->blend_active)
+		deactivate_blend(vc, parent);
+
 	obs_source_t *filter = obs_source_get_filter_by_name(
 		parent, vc->blend_filter_name);
 	if (filter) {
+		if (filter == vc->source) {
+			obs_source_release(filter);
+			return;
+		}
+
+		vc->blend_filter_was_enabled = obs_source_enabled(filter);
+		bfree(vc->active_blend_filter_name);
+		vc->active_blend_filter_name = bstrdup(vc->blend_filter_name);
 		obs_source_set_enabled(filter, true);
 		vc->blend_active = true;
 		vc->blend_timer = (float)vc->blend_duration_ms / 1000.0f;
@@ -189,17 +245,29 @@ static void activate_blend(video_cutter_t *vc, obs_source_t *parent)
 
 static void deactivate_blend(video_cutter_t *vc, obs_source_t *parent)
 {
-	if (!vc->blend_active || !vc->blend_filter_name ||
-	    vc->blend_filter_name[0] == '\0')
+	if (!vc->blend_active)
 		return;
 
+	const char *filter_name = vc->active_blend_filter_name ?
+		vc->active_blend_filter_name :
+		vc->blend_filter_name;
+	if (!filter_name || filter_name[0] == '\0') {
+		vc->blend_active = false;
+		vc->blend_filter_was_enabled = false;
+		return;
+	}
+
 	obs_source_t *filter = obs_source_get_filter_by_name(
-		parent, vc->blend_filter_name);
+		parent, filter_name);
 	if (filter) {
-		obs_source_set_enabled(filter, false);
+		if (filter != vc->source && !vc->blend_filter_was_enabled)
+			obs_source_set_enabled(filter, false);
 		obs_source_release(filter);
 	}
 	vc->blend_active = false;
+	vc->blend_filter_was_enabled = false;
+	bfree(vc->active_blend_filter_name);
+	vc->active_blend_filter_name = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -221,9 +289,16 @@ static void *vc_create(obs_data_t *settings, obs_source_t *source)
 	srand((unsigned)time(NULL));
 
 	vc->blend_filter_name = NULL;
+	vc->active_blend_filter_name = NULL;
+	vc->last_media_time_ms = 0;
+	vc->last_duration_ms = 0;
+	vc->have_last_media_time = false;
+	vc->manual_seek_cooldown = 0.0f;
+	vc->own_seek_grace = 0.0f;
 	vc->elapsed = 0.0f;
 	vc->blend_timer = 0.0f;
 	vc->blend_active = false;
+	vc->blend_filter_was_enabled = false;
 
 	obs_source_update(source, settings);
 	return vc;
@@ -234,6 +309,7 @@ static void vc_destroy(void *data)
 	video_cutter_t *vc = data;
 	pthread_mutex_destroy(&vc->config_mutex);
 	bfree(vc->blend_filter_name);
+	bfree(vc->active_blend_filter_name);
 	bfree(vc);
 }
 
@@ -430,14 +506,22 @@ static bool on_region_set_button(obs_properties_t *props,
 }
 
 /* Callback: enumerate sibling filters for the blend dropdown */
+struct enum_filters_ctx {
+	video_cutter_t *vc;
+	obs_property_t *list;
+};
+
 static void enum_filters_cb(obs_source_t *parent, obs_source_t *child,
 			    void *param)
 {
 	UNUSED_PARAMETER(parent);
-	obs_property_t *list = param;
+	struct enum_filters_ctx *ctx = param;
+	if (!ctx || child == ctx->vc->source)
+		return;
+
 	const char *name = obs_source_get_name(child);
 	if (name)
-		obs_property_list_add_string(list, name, name);
+		obs_property_list_add_string(ctx->list, name, name);
 }
 
 static obs_properties_t *vc_get_properties(void *data)
@@ -483,8 +567,10 @@ static obs_properties_t *vc_get_properties(void *data)
 				     obs_module_text("BlendFilterNone"), "");
 
 	obs_source_t *parent = obs_filter_get_parent(vc->source);
-	if (parent)
-		obs_source_enum_filters(parent, enum_filters_cb, blend_list);
+	if (parent) {
+		struct enum_filters_ctx ctx = {vc, blend_list};
+		obs_source_enum_filters(parent, enum_filters_cb, &ctx);
+	}
 
 	obs_properties_add_int(grp_blend, "blend_duration_ms",
 			       obs_module_text("BlendDuration"), 50, 5000,
@@ -492,9 +578,11 @@ static obs_properties_t *vc_get_properties(void *data)
 
 	obs_property_set_modified_callback(blend_toggle, on_blend_toggle);
 	obs_property_set_visible(
-		obs_properties_get(grp_blend, "blend_filter_name"), false);
+		obs_properties_get(grp_blend, "blend_filter_name"),
+		vc->blend_enabled);
 	obs_property_set_visible(
-		obs_properties_get(grp_blend, "blend_duration_ms"), false);
+		obs_properties_get(grp_blend, "blend_duration_ms"),
+		vc->blend_enabled);
 
 	obs_properties_add_group(props, "grp_blend",
 				 obs_module_text("GroupBlend"),
@@ -545,12 +633,13 @@ static obs_properties_t *vc_get_properties(void *data)
 			obs_module_text("RegionSetEnd"),
 			on_region_set_button);
 
-		obs_property_set_visible(p_sh, false);
-		obs_property_set_visible(p_sm, false);
-		obs_property_set_visible(p_eh, false);
-		obs_property_set_visible(p_em, false);
-		obs_property_set_visible(p_bs, false);
-		obs_property_set_visible(p_be, false);
+		bool region_active = vc->regions[i].enabled;
+		obs_property_set_visible(p_sh, region_active);
+		obs_property_set_visible(p_sm, region_active);
+		obs_property_set_visible(p_eh, region_active);
+		obs_property_set_visible(p_em, region_active);
+		obs_property_set_visible(p_bs, region_active);
+		obs_property_set_visible(p_be, region_active);
 
 		obs_property_set_modified_callback(region_toggle,
 						   on_region_toggle);
@@ -601,33 +690,82 @@ static void vc_video_tick(void *data, float seconds)
 	int64_t current = obs_source_media_get_time(parent);
 
 	if (duration <= 0 || current < 0) {
+		vc->have_last_media_time = false;
+		vc->last_duration_ms = 0;
+		pthread_mutex_unlock(&vc->config_mutex);
+		return;
+	}
+
+	if (vc->last_duration_ms > 0 && duration != vc->last_duration_ms) {
+		vc->elapsed = 0.0f;
+		vc->manual_seek_cooldown = 0.0f;
+		vc->own_seek_grace = 0.0f;
+		vc->last_duration_ms = duration;
+		remember_media_position(vc, current);
+		pthread_mutex_unlock(&vc->config_mutex);
+		return;
+	}
+	vc->last_duration_ms = duration;
+
+	enum obs_media_state state = obs_source_media_get_state(parent);
+	if (state != OBS_MEDIA_STATE_PLAYING) {
+		vc->elapsed = 0.0f;
+		vc->manual_seek_cooldown = 0.0f;
+		vc->own_seek_grace = 0.0f;
+		remember_media_position(vc, current);
+		pthread_mutex_unlock(&vc->config_mutex);
+		return;
+	}
+
+	if (vc->own_seek_grace > 0.0f) {
+		vc->own_seek_grace -= seconds;
+		vc->elapsed = 0.0f;
+		remember_media_position(vc, current);
+		pthread_mutex_unlock(&vc->config_mutex);
+		return;
+	}
+
+	if (vc->manual_seek_cooldown > 0.0f) {
+		vc->manual_seek_cooldown -= seconds;
+		vc->elapsed = 0.0f;
+		remember_media_position(vc, current);
+		pthread_mutex_unlock(&vc->config_mutex);
+		return;
+	}
+
+	if (detected_external_seek(vc, current, seconds)) {
+		vc->manual_seek_cooldown = MANUAL_SEEK_COOLDOWN_SEC;
+		vc->elapsed = 0.0f;
+		remember_media_position(vc, current);
 		pthread_mutex_unlock(&vc->config_mutex);
 		return;
 	}
 
 	/* Check whether we have any active regions and whether current
 	 * position is outside all of them — outside = taboo, snap immediately */
-	bool has_regions = false;
-	for (int i = 0; i < MAX_REGIONS; i++) {
-		if (vc->regions[i].enabled &&
-		    vc->regions[i].end_ms > vc->regions[i].start_ms) {
-			has_regions = true;
-			break;
-		}
-	}
-	bool outside = has_regions && !is_inside_any_region(vc, current);
+	active_region_t active[MAX_REGIONS];
+	bool has_regions = build_active_regions(vc, active, duration) > 0;
+	bool outside = has_regions &&
+		       !is_inside_any_region(vc, current, duration);
 
 	vc->elapsed += seconds;
 	bool interval_due = vc->elapsed >= (float)vc->cut_interval_sec;
 
 	if (!outside && !interval_due) {
+		remember_media_position(vc, current);
 		pthread_mutex_unlock(&vc->config_mutex);
 		return;
 	}
 	vc->elapsed = 0.0f;
 
 	int64_t next = compute_next_position(vc, current, duration);
+	if (next < 0)
+		next = 0;
+	if (duration > 0 && next >= duration)
+		next = duration > 1 ? duration - 1 : 0;
 	obs_source_media_set_time(parent, next);
+	remember_media_position(vc, next);
+	vc->own_seek_grace = OWN_SEEK_GRACE_SEC;
 
 	/* Only blend on a planned interval cut, not on outside-snap correction */
 	if (interval_due && !outside)

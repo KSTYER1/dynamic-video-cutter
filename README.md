@@ -63,9 +63,18 @@ cmake --build --preset windows-x64 --config RelWithDebInfo
 ```
 
 The packaged Windows release is published separately as
-`dynamic-video-cutter-1.0.0.zip`.
+`dynamic-video-cutter-1.0.1.zip`.
 
 ## Version History
+
+### 1.0.1
+
+- Fixed saved blend settings being hidden when reopening filter properties.
+- Fixed enabled playback regions being hidden when reopening filter properties.
+- Prevented the cutter from selecting and disabling itself as blend filter.
+- Preserved the previous enabled state of the selected blend filter.
+- Added protection against manual video seeking while the cutter is running.
+- Ignored or clamped playback regions that do not fit the current video.
 
 ### 1.0.0
 
