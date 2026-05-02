@@ -94,3 +94,7 @@ Dynamic Video Cutter is licensed under GPL-2.0-or-later.
 
 Dynamic Video Cutter is an unofficial third-party plugin and is not affiliated
 with or endorsed by the OBS Project.
+
+AI-assisted tools were used during development and release preparation. The
+maintainer is responsible for reviewing, testing, and publishing the released
+plugin.
